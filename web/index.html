@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>xsleaker control</title>
+</head>
+<body>
+  <script>
+    const ws = new WebSocket('ws://127.0.0.1:8001');
+    let nextId = 1;
+
+    ws.addEventListener('open', () => console.log('connected'));
+    ws.addEventListener('close', () => console.log('disconnected'));
+    ws.addEventListener('error', (e) => console.error('websocket error', e));
+    ws.addEventListener('message', (event) => console.log('<', event.data));
+
+    function closeSockets(count) {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const request = {
+        jsonrpc: '2.0',
+        method: 'closeSockets',
+        params: { count },
+        id: nextId++,
+      };
+      ws.send(JSON.stringify(request));
+    }
+  </script>
+</body>
+</html>
