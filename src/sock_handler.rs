@@ -15,9 +15,9 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 // timeout an intervening proxy or Chrome itself might apply.
 const STATUS_LINE: &[u8] = b"HTTP/1.1 200 OK\r\n";
 const KEEPALIVE_HEADER: &[u8] = b"X-Keepalive: 1\r\n";
-// The blank line that completes the response headers, sent only when we
-// deliberately finish a held connection.
-const END_HEADERS: &[u8] = b"\r\n";
+// Declares the connection non-reusable and completes the response headers
+// (the blank line), sent only when we deliberately finish a held connection.
+const END_HEADERS: &[u8] = b"Connection: close\r\n\r\n";
 
 struct Connection {
     handle: JoinHandle<()>,
