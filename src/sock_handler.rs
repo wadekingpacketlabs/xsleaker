@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -46,17 +46,42 @@ impl SockHandler{
     /// sending the blank line that would complete the response. Returns
     /// (letting the socket close) only once the peer goes away or this task
     /// is aborted by `close`.
-    async fn hold_connection(mut conn: TcpStream) {
-        if conn.write_all(STATUS_LINE).await.is_err() {
+    ///
+    /// Concurrently drains and discards whatever the peer sends: if the
+    /// request bytes are left unread in the kernel receive buffer, closing
+    /// the socket later sends a TCP RST instead of a graceful FIN, which
+    /// Chrome treats as a retryable network error and silently reopens a
+    /// replacement connection for the same request.
+    async fn hold_connection(conn: TcpStream) {
+        let (mut reader, mut writer) = conn.into_split();
+
+        if writer.write_all(STATUS_LINE).await.is_err() {
             return;
         }
 
-        let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
-        loop {
-            ticker.tick().await;
-            if conn.write_all(KEEPALIVE_HEADER).await.is_err() {
-                return;
+        let drain = async {
+            let mut buf = [0u8; 1024];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
             }
+        };
+
+        let keepalive = async {
+            let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
+            loop {
+                ticker.tick().await;
+                if writer.write_all(KEEPALIVE_HEADER).await.is_err() {
+                    return;
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = drain => {},
+            _ = keepalive => {},
         }
     }
 
