@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::error::SocketError;
@@ -15,9 +15,17 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 // timeout an intervening proxy or Chrome itself might apply.
 const STATUS_LINE: &[u8] = b"HTTP/1.1 200 OK\r\n";
 const KEEPALIVE_HEADER: &[u8] = b"X-Keepalive: 1\r\n";
+// The blank line that completes the response headers, sent only when we
+// deliberately finish a held connection.
+const END_HEADERS: &[u8] = b"\r\n";
+
+struct Connection {
+    handle: JoinHandle<()>,
+    finish: oneshot::Sender<()>,
+}
 
 pub struct SockHandler{
-    connections: Arc<RwLock<Vec<JoinHandle<()>>>>,
+    connections: Arc<RwLock<Vec<Connection>>>,
     soc_recv_handle: JoinHandle<()>
 }
 
@@ -33,8 +41,9 @@ impl SockHandler{
                 let res = listener.accept().await;
                 if let Ok((conn, _)) = res{
                     println!("received connection!");
-                    let handle = tokio::spawn(Self::hold_connection(conn));
-                    connections_copy.write().await.push(handle);
+                    let (finish_tx, finish_rx) = oneshot::channel();
+                    let handle = tokio::spawn(Self::hold_connection(conn, finish_rx));
+                    connections_copy.write().await.push(Connection { handle, finish: finish_tx });
                 }
             }
         });
@@ -43,62 +52,65 @@ impl SockHandler{
 
     /// Holds a connection open indefinitely: writes a status line and then
     /// trickles a harmless header line every `KEEPALIVE_INTERVAL`, never
-    /// sending the blank line that would complete the response. Returns
-    /// (letting the socket close) only once the peer goes away or this task
-    /// is aborted by `close`.
+    /// sending the blank line that would complete the response. Concurrently
+    /// drains and discards whatever the peer sends, so the kernel receive
+    /// buffer never has unread data sitting in it.
     ///
-    /// Concurrently drains and discards whatever the peer sends: if the
-    /// request bytes are left unread in the kernel receive buffer, closing
-    /// the socket later sends a TCP RST instead of a graceful FIN, which
-    /// Chrome treats as a retryable network error and silently reopens a
-    /// replacement connection for the same request.
-    async fn hold_connection(conn: TcpStream) {
+    /// Ends either when the peer goes away, or when `finish` fires: `close`
+    /// uses that to ask for a graceful end instead of yanking the socket
+    /// out from under an in-flight response. Writing the blank line that
+    /// completes the headers and then shutting down cleanly gives the
+    /// browser a normal, fully-finished 200 response (connection-close
+    /// framed, empty body) rather than a reset mid-response — Chrome treats
+    /// a reset on a pending idempotent request as a retryable network error
+    /// and silently reopens a replacement connection, which is what was
+    /// making the open-connection count jump around on close.
+    async fn hold_connection(conn: TcpStream, mut finish: oneshot::Receiver<()>) {
         let (mut reader, mut writer) = conn.into_split();
 
         if writer.write_all(STATUS_LINE).await.is_err() {
             return;
         }
 
-        let drain = async {
-            let mut buf = [0u8; 1024];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) => {}
-                }
-            }
-        };
+        let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
+        let mut buf = [0u8; 1024];
 
-        let keepalive = async {
-            let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
-            loop {
-                ticker.tick().await;
-                if writer.write_all(KEEPALIVE_HEADER).await.is_err() {
+        loop {
+            tokio::select! {
+                read_result = reader.read(&mut buf) => {
+                    match read_result {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                }
+                _ = ticker.tick() => {
+                    if writer.write_all(KEEPALIVE_HEADER).await.is_err() {
+                        return;
+                    }
+                }
+                _ = &mut finish => {
+                    let _ = writer.write_all(END_HEADERS).await;
+                    let _ = writer.shutdown().await;
                     return;
                 }
             }
-        };
-
-        tokio::select! {
-            _ = drain => {},
-            _ = keepalive => {},
         }
     }
 
     /// Closes up to `count` currently open socket connections. Returns the number actually closed.
     pub async fn close(&self, count: usize) -> usize {
         let mut connections = self.connections.write().await;
-        connections.retain(|handle| !handle.is_finished());
+        connections.retain(|c| !c.handle.is_finished());
         let n = count.min(connections.len());
-        for handle in connections.drain(0..n) {
-            handle.abort();
+        for conn in connections.drain(0..n) {
+            let _ = conn.finish.send(());
         }
         n
     }
 
     pub async fn len(&self) -> usize {
         let mut connections = self.connections.write().await;
-        connections.retain(|handle| !handle.is_finished());
+        connections.retain(|c| !c.handle.is_finished());
         connections.len()
     }
 }
