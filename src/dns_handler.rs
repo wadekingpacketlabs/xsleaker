@@ -1,3 +1,4 @@
+use std::println;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -90,7 +91,9 @@ impl RequestHandler for DnsRequestHandler {
         let record_type = query.query_type();
 
         // Serve the configured response IP for any query matching our listen suffix
-        if record_type == RecordType::A && name.ends_with(&self.listen_suffix) {
+        println!("{}", name);
+        let suffix = String::from(self.listen_suffix.clone() + ".");
+        if record_type == RecordType::A && name.ends_with(&suffix) {
             let mut metadata = Metadata::response_from_request(&request.metadata);
             metadata.response_code = ResponseCode::NoError;
 
