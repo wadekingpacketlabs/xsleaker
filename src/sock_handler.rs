@@ -20,6 +20,13 @@ const REQUEST_GRACE_PERIOD: Duration = Duration::from_millis(750);
 // instead of resolving, while the periodic write still resets any idle
 // timeout an intervening proxy or Chrome itself might apply.
 const STATUS_LINE: &[u8] = b"HTTP/1.1 200 OK\r\n";
+// Lets page JS read the response (status, headers, timing) across origins
+// instead of getting an opaque result, so it can actually measure timing.
+const CORS_HEADER: &[u8] = b"Access-Control-Allow-Origin: *\r\n";
+// Without this, cross-origin PerformanceResourceTiming entries are clamped
+// to a coarse start/end time only — this unlocks the detailed timestamps
+// (responseStart, header/body sizes, etc).
+const TIMING_HEADER: &[u8] = b"Timing-Allow-Origin: *\r\n";
 const KEEPALIVE_HEADER: &[u8] = b"X-Keepalive: 1\r\n";
 // Declares the connection non-reusable and completes the response headers
 // (the blank line), sent only when we deliberately finish a held connection.
@@ -85,6 +92,12 @@ impl SockHandler{
         }
 
         if writer.write_all(STATUS_LINE).await.is_err() {
+            return;
+        }
+        if writer.write_all(CORS_HEADER).await.is_err() {
+            return;
+        }
+        if writer.write_all(TIMING_HEADER).await.is_err() {
             return;
         }
 
