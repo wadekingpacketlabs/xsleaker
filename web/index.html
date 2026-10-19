@@ -24,6 +24,17 @@
       };
       ws.send(JSON.stringify(request));
     }
+
+    function connectionCount() {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const request = {
+        jsonrpc: '2.0',
+        method: 'connectionCount',
+        params: {},
+        id: nextId++,
+      };
+      ws.send(JSON.stringify(request));
+    }
   </script>
 </body>
 </html>

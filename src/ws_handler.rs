@@ -158,6 +158,7 @@ impl ClientConnection {
     async fn dispatch(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         match method {
             "closeSockets" => self.close_sockets(params).await,
+            "connectionCount" => self.connection_count().await,
             _ => Err(RpcError { code: jsonrpc::METHOD_NOT_FOUND, message: format!("method not found: {method}") }),
         }
     }
@@ -178,6 +179,11 @@ impl ClientConnection {
         let remaining = self.sock_handler.len().await;
 
         Ok(serde_json::json!({ "closed": closed, "remaining": remaining }))
+    }
+
+    async fn connection_count(&self) -> Result<Value, RpcError> {
+        let count = self.sock_handler.len().await;
+        Ok(serde_json::json!({ "count": count }))
     }
 
     async fn send_response(&self, response: Response) {
