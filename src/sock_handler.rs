@@ -9,6 +9,12 @@ use tokio::task::JoinHandle;
 use crate::error::SocketError;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+// How long we'll wait for the peer to actually send request bytes before
+// giving up on the connection. A real fetch() sends its request the instant
+// the TCP handshake completes, so a socket that's still silent after this
+// long is almost certainly an unused speculative/preconnect socket rather
+// than a real request, and we drop it instead of holding/counting it.
+const REQUEST_GRACE_PERIOD: Duration = Duration::from_millis(750);
 // A header line with no terminating blank line after it, so the response
 // headers never finish: the browser's fetch() keeps waiting on the socket
 // instead of resolving, while the periodic write still resets any idle
@@ -67,13 +73,22 @@ impl SockHandler{
     /// making the open-connection count jump around on close.
     async fn hold_connection(conn: TcpStream, mut finish: oneshot::Receiver<()>) {
         let (mut reader, mut writer) = conn.into_split();
+        let mut buf = [0u8; 1024];
+
+        match tokio::time::timeout(REQUEST_GRACE_PERIOD, reader.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {}
+            _ => {
+                // Either the peer never sent anything (timed out) or it
+                // closed before sending a request — not a real fetch().
+                return;
+            }
+        }
 
         if writer.write_all(STATUS_LINE).await.is_err() {
             return;
         }
 
         let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
-        let mut buf = [0u8; 1024];
 
         loop {
             tokio::select! {
