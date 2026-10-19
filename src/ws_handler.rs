@@ -4,6 +4,7 @@ use std::println;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
@@ -18,7 +19,8 @@ use crate::error::WsError;
 use crate::jsonrpc::{self, Id, Request, Response, RpcError};
 use crate::sock_handler::SockHandler;
 
-type WsStream = Arc<Mutex<WebSocketStream<TcpStream>>>;
+type WsSink = Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>;
+type WsSource = SplitStream<WebSocketStream<TcpStream>>;
 type PendingRequests = Arc<RwLock<HashSet<Id>>>;
 
 pub struct WsHandler {
@@ -57,15 +59,17 @@ impl WsHandler {
 
                     println!("websocket connection established with {addr}");
 
+                    let (sink, source) = ws_stream.split();
+
                     let connection = Arc::new(ClientConnection {
                         id,
                         addr,
-                        conn: Arc::new(Mutex::new(ws_stream)),
+                        sink: Arc::new(Mutex::new(sink)),
                         pending: Arc::new(RwLock::new(HashSet::new())),
                         sock_handler,
                     });
 
-                    connection.run().await;
+                    connection.run(source).await;
                 });
             }
         });
@@ -84,15 +88,15 @@ struct ClientConnection {
     #[allow(dead_code)]
     id: u64,
     addr: SocketAddr,
-    conn: WsStream,
+    sink: WsSink,
     pending: PendingRequests,
     sock_handler: Arc<SockHandler>,
 }
 
 impl ClientConnection {
-    async fn run(self: Arc<Self>) {
+    async fn run(self: Arc<Self>, mut source: WsSource) {
         loop {
-            let msg = self.conn.lock().await.next().await;
+            let msg = source.next().await;
 
             match msg {
                 Some(Ok(Message::Text(text))) => {
@@ -102,7 +106,7 @@ impl ClientConnection {
                     });
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    if let Err(e) = self.conn.lock().await.send(Message::Pong(payload)).await {
+                    if let Err(e) = self.sink.lock().await.send(Message::Pong(payload)).await {
                         eprintln!("failed to send pong to {}: {e}", self.addr);
                         break;
                     }
@@ -195,7 +199,7 @@ impl ClientConnection {
             }
         };
 
-        if let Err(e) = self.conn.lock().await.send(Message::text(text)).await {
+        if let Err(e) = self.sink.lock().await.send(Message::text(text)).await {
             eprintln!("failed to send json-rpc response: {e}");
         }
     }
