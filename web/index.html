@@ -6,34 +6,136 @@
 </head>
 <body>
   <script>
-    const ws = new WebSocket('ws://127.0.0.1:8001');
+    // Target the websocket control channel is on.
+    const WS_HOST = 'ldns.us-west-3.com:8001';
+    // Suffix http connections are made against (matches the server's
+    // --suffix-dns, which resolves any subdomain of it to --resolved-address).
+    // Each http connection gets its own random subdomain of this suffix so
+    // it lands on a distinct origin and isn't coalesced with others.
+    const HTTP_HOST_SUFFIX = 'lr.us-west-3.com:8989';
+
+    const ws = new WebSocket(`ws://${WS_HOST}`);
     let nextId = 1;
+    const pending = new Map();
+
+    function randomHttpTarget() {
+      const subdomain = Math.random().toString(36).slice(2, 10);
+      return `http://${subdomain}.${HTTP_HOST_SUFFIX}/`;
+    }
 
     ws.addEventListener('open', () => console.log('connected'));
     ws.addEventListener('close', () => console.log('disconnected'));
     ws.addEventListener('error', (e) => console.error('websocket error', e));
-    ws.addEventListener('message', (event) => console.log('<', event.data));
+    ws.addEventListener('message', (event) => {
+      console.log('<', event.data);
+
+      let response;
+      try {
+        response = JSON.parse(event.data);
+      } catch (e) {
+        return;
+      }
+
+      const request = pending.get(response.id);
+      if (!request) return;
+      pending.delete(response.id);
+
+      if (response.error) {
+        request.reject(response.error);
+      } else {
+        request.resolve(response.result);
+      }
+    });
+
+    // Sends a jsonrpc request and returns a promise that resolves/rejects
+    // once the response with the matching id comes back.
+    function call(method, params = {}) {
+      return new Promise((resolve, reject) => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          reject(new Error('websocket is not open'));
+          return;
+        }
+
+        const id = nextId++;
+        pending.set(id, { resolve, reject });
+        ws.send(JSON.stringify({ jsonrpc: '2.0', method, params, id }));
+      });
+    }
 
     function closeSockets(count) {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      const request = {
-        jsonrpc: '2.0',
-        method: 'closeSockets',
-        params: { count },
-        id: nextId++,
-      };
-      ws.send(JSON.stringify(request));
+      return call('closeSockets', { count });
     }
 
     function connectionCount() {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      const request = {
-        jsonrpc: '2.0',
-        method: 'connectionCount',
-        params: {},
-        id: nextId++,
-      };
-      ws.send(JSON.stringify(request));
+      return call('connectionCount');
+    }
+
+    // Opens one connection at a time (no batching) with a short delay
+    // between each, so we land precisely on the real cap instead of
+    // overshooting past it in a big jump. Stops the instant a fetch()
+    // fails to grow the count — that's the cap, for this pass.
+    async function fillOneAtATime({ delayMs = 150 } = {}) {
+      let { count: lastCount } = await connectionCount();
+
+      while (true) {
+        fetch(randomHttpTarget(), { mode: 'no-cors' }).catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+        const { count } = await connectionCount();
+        console.log('connections:', count);
+
+        if (count <= lastCount) {
+          return count;
+        }
+
+        lastCount = count;
+      }
+    }
+
+    // Releases one connection at a time and, after each release, tries a
+    // fresh fetch() to see if it actually gets through — that's the point
+    // where exactly one slot just opened up. Returns once it does.
+    async function drainUntilOneOpens({ delayMs = 150 } = {}) {
+      while (true) {
+        await closeSockets(1);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+        const { count: before } = await connectionCount();
+        fetch(randomHttpTarget(), { mode: 'no-cors' }).catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+        const { count: after } = await connectionCount();
+        console.log('connections:', after);
+
+        if (after > before) {
+          return after;
+        }
+      }
+    }
+
+    // Fills the pool to its cap, then drains down to exactly one spare
+    // slot (a 1-connection oracle) — repeating the whole up/down cycle
+    // until it lands on the same count `stableRounds` times in a row, so
+    // we know it's a reliably reproducible operating point rather than a
+    // one-off fluke. Resolves with the stable count.
+    async function fillConnections({ delayMs = 150, stableRounds = 3 } = {}) {
+      let stableCount = null;
+      let streak = 0;
+
+      while (streak < stableRounds) {
+        await fillOneAtATime({ delayMs });
+        const count = await drainUntilOneOpens({ delayMs });
+        console.log('oracle at', count);
+
+        if (count === stableCount) {
+          streak++;
+        } else {
+          stableCount = count;
+          streak = 1;
+        }
+      }
+
+      return stableCount;
     }
   </script>
 </body>

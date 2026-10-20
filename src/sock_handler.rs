@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -31,6 +31,14 @@ const KEEPALIVE_HEADER: &[u8] = b"X-Keepalive: 1\r\n";
 // Declares the connection non-reusable and completes the response headers
 // (the blank line), sent only when we deliberately finish a held connection.
 const END_HEADERS: &[u8] = b"Connection: close\r\n\r\n";
+
+/// Pulls the request path out of a buffer holding (at least the start of)
+/// an HTTP request, e.g. b"GET /time HTTP/1.1\r\n..." -> Some("/time").
+fn request_path(buf: &[u8]) -> Option<&str> {
+    let line_end = buf.iter().position(|&b| b == b'\n')?;
+    let line = std::str::from_utf8(&buf[..line_end]).ok()?.trim_end_matches('\r');
+    line.split_whitespace().nth(1)
+}
 
 struct Connection {
     handle: JoinHandle<()>,
@@ -78,17 +86,28 @@ impl SockHandler{
     /// a reset on a pending idempotent request as a retryable network error
     /// and silently reopens a replacement connection, which is what was
     /// making the open-connection count jump around on close.
+    ///
+    /// Exception: a request for `/time` is answered immediately with the
+    /// current server time and closed normally — a probe endpoint that
+    /// doesn't hang, for use with the one spare slot left after filling
+    /// the pool.
     async fn hold_connection(conn: TcpStream, mut finish: oneshot::Receiver<()>) {
         let (mut reader, mut writer) = conn.into_split();
         let mut buf = [0u8; 1024];
 
-        match tokio::time::timeout(REQUEST_GRACE_PERIOD, reader.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => {}
+        let n = match tokio::time::timeout(REQUEST_GRACE_PERIOD, reader.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => n,
             _ => {
                 // Either the peer never sent anything (timed out) or it
                 // closed before sending a request — not a real fetch().
                 return;
             }
+        };
+
+        if request_path(&buf[..n]) == Some("/time") {
+            let _ = Self::write_time_response(&mut writer).await;
+            let _ = writer.shutdown().await;
+            return;
         }
 
         if writer.write_all(STATUS_LINE).await.is_err() {
@@ -123,6 +142,19 @@ impl SockHandler{
                 }
             }
         }
+    }
+
+    /// Writes a complete, immediate 200 response carrying the current
+    /// server time in milliseconds since the Unix epoch.
+    async fn write_time_response(writer: &mut tokio::net::tcp::OwnedWriteHalf) -> std::io::Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let body = now.as_millis().to_string();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nTiming-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        writer.write_all(head.as_bytes()).await?;
+        writer.write_all(body.as_bytes()).await
     }
 
     /// Closes up to `count` currently open socket connections. Returns the number actually closed.
